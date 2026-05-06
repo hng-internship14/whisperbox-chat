@@ -35,7 +35,7 @@ const buildIceConfig = () => {
 
 const ICE_CONFIG = buildIceConfig();
 
-export const useWebRTC = ({ user, onCallStateChange }) => {
+export const useWebRTC = ({ user, onCallStateChange, onCallLogged }) => {
   const [callState, setCallState] = useState(CALL_STATE.IDLE);
   const [partner, setPartner] = useState(null);
   const [callType, setCallType] = useState('voice'); // 'voice' | 'video'
@@ -70,16 +70,22 @@ export const useWebRTC = ({ user, onCallStateChange }) => {
   }, [localStream]);
 
   const endCall = useCallback((reason = 'ended', remoteNotified = false) => {
-    if (callStartTime.current && partner) {
-      const duration = Math.floor((Date.now() - callStartTime.current) / 1000);
-      callLogService.addLog(user.id, {
-        partnerId:    partner.user_id || partner.id,
-        partnerName:  partner.display_name || partner.username || 'Unknown',
+    if (partner) {
+      const duration = callStartTime.current
+        ? Math.floor((Date.now() - callStartTime.current) / 1000)
+        : 0;
+      const direction = callState === CALL_STATE.OFFERING ? 'outgoing' : 'incoming';
+      const logEntry = {
+        partnerId: partner.user_id || partner.id,
+        partnerName: partner.display_name || partner.username || 'Unknown',
         partnerAvatar: partner.avatar || null,
-        type:         callType,
-        direction:    callState === CALL_STATE.OFFERING ? 'outgoing' : 'incoming',
+        type: callType,
+        direction,
         durationSeconds: duration,
-      });
+        reason,
+      };
+      callLogService.addLog(user.id, logEntry);
+      onCallLogged?.(logEntry);
     }
 
     if (!remoteNotified && partner) {
@@ -106,7 +112,7 @@ export const useWebRTC = ({ user, onCallStateChange }) => {
       callStartTime.current = null;
       setCallError('');
     }, 2000);
-  }, [partner, callType, callState, user.id, cleanup]);
+  }, [partner, callType, callState, user.id, cleanup, onCallLogged]);
 
   const initPeerConnection = useCallback((targetPartnerId) => {
     if (pc.current) return pc.current;

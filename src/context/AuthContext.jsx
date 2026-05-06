@@ -107,6 +107,7 @@ export const AuthProvider = ({ children }) => {
       const decryptedPrivateKey = await unwrapPrivateKey(data.user.wrapped_private_key, wrappingKey);
       
       const importedKey = await importPrivateKey(decryptedPrivateKey);
+      sessionStorageService.setPrivateKey(decryptedPrivateKey);
       setPrivateKey(importedKey);
       const localProfile = loadExtendedProfile(data.user.id);
       setUser(mergeUser({
@@ -147,7 +148,9 @@ export const AuthProvider = ({ children }) => {
         accessToken: data.access_token,
         refreshToken: data.refresh_token,
       });
+      setToken(data.access_token);
       const importedKey = await importPrivateKey(rawPrivateKey);
+      sessionStorageService.setPrivateKey(rawPrivateKey);
       setPrivateKey(importedKey);
       const localProfile = {
         display_name: displayName,
@@ -303,14 +306,12 @@ export const AuthProvider = ({ children }) => {
       if (accessToken) {
         try {
           const profile = await authService.me();
+          const storedPrivateKey = sessionStorageService.getPrivateKey();
           setUser(mergeUser(profile));
-          
-          // Try to get wrapped key from somewhere if possible, but for now we need the password to unwrap.
-          // In a real app, you might use biometrics or a session key to unwrap.
-          // For now, if we don't have privateKey in state, we might need to re-auth or 
-          // have the user provide password. 
-          // However, we'll try to recover from sessionStorage if we stored it (unsafe but works for demo).
-          
+          if (storedPrivateKey) {
+            const importedKey = await importPrivateKey(storedPrivateKey);
+            setPrivateKey(importedKey);
+          }
           setSettings(loadSettings(profile.id));
           setContacts(userStorageService.getContacts(profile.id));
           socketService.connect(accessToken);

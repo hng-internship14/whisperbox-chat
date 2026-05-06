@@ -1,4 +1,5 @@
 const ACTIVE_SESSION_KEY = 'wb_active_session';
+const ACTIVE_PRIVATE_KEY = 'wb_active_private_key';
 const SESSION_LIST_KEY = 'wb_sessions';
 
 const safeJsonParse = (value, fallback) => {
@@ -11,6 +12,56 @@ const safeJsonParse = (value, fallback) => {
 };
 
 const makeUserKey = (prefix, userId) => `${prefix}_${userId}`;
+const MESSAGE_CACHE_LIMIT = 60;
+
+const trimMessageForCache = (message) => {
+  const next = { ...message };
+
+  // The payload can be rebuilt from the server; keeping it locally quickly blows past quota.
+  delete next.payload;
+
+  if (typeof next.decrypted === 'string') {
+    try {
+      const parsed = JSON.parse(next.decrypted);
+      if (parsed?.v === 1 && parsed.image) {
+        next.decrypted = JSON.stringify({
+          ...parsed,
+          image: null,
+          imageCachedOut: true,
+          imageName: parsed.imageName || null,
+        });
+      }
+    } catch {
+      // Leave legacy/plaintext decrypted values untouched.
+    }
+  }
+
+  return next;
+};
+
+const safeLocalStorageSet = (key, value, fallbackReducer = null) => {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch (error) {
+    if (error?.name !== 'QuotaExceededError' && !String(error).includes('quota')) {
+      throw error;
+    }
+
+    if (typeof fallbackReducer === 'function') {
+      try {
+        localStorage.setItem(key, fallbackReducer());
+        return true;
+      } catch {
+        localStorage.removeItem(key);
+      }
+    } else {
+      localStorage.removeItem(key);
+    }
+
+    return false;
+  }
+};
 
 export const sessionStorageService = {
   getActiveSession() {
@@ -48,6 +99,7 @@ export const sessionStorageService = {
     sessionStorage.removeItem(ACTIVE_SESSION_KEY);
     sessionStorage.removeItem('access_token');
     sessionStorage.removeItem('refresh_token');
+    sessionStorage.removeItem(ACTIVE_PRIVATE_KEY);
   },
 
   getAccessToken() {
@@ -60,6 +112,15 @@ export const sessionStorageService = {
 
   listSessions() {
     return safeJsonParse(localStorage.getItem(SESSION_LIST_KEY), []);
+  },
+
+  setPrivateKey(privateKeyBase64) {
+    if (!privateKeyBase64) return;
+    sessionStorage.setItem(ACTIVE_PRIVATE_KEY, privateKeyBase64);
+  },
+
+  getPrivateKey() {
+    return sessionStorage.getItem(ACTIVE_PRIVATE_KEY);
   },
 };
 
@@ -134,7 +195,9 @@ export const userStorageService = {
 
   setConversations(userId, conversations) {
     if (!userId) return;
-    localStorage.setItem(makeUserKey('wb_conversations', userId), JSON.stringify(conversations.slice(0, 200)));
+    const key = makeUserKey('wb_conversations', userId);
+    const trimmed = conversations.slice(0, 100);
+    safeLocalStorageSet(key, JSON.stringify(trimmed), () => JSON.stringify(trimmed.slice(0, 40)));
   },
 
   getMessages(userId, partnerId) {
@@ -144,8 +207,11 @@ export const userStorageService = {
 
   setMessages(userId, partnerId, messages) {
     if (!userId || !partnerId) return;
-    // Keep last 200 messages locally
-    localStorage.setItem(makeUserKey(`messages_${partnerId}`, userId), JSON.stringify(messages.slice(-200)));
+    const key = makeUserKey(`messages_${partnerId}`, userId);
+    const trimmed = messages.slice(-MESSAGE_CACHE_LIMIT).map(trimMessageForCache);
+    safeLocalStorageSet(key, JSON.stringify(trimmed), () =>
+      JSON.stringify(trimmed.slice(-25).map((message) => ({ ...message, decrypted: typeof message.decrypted === 'string' ? message.decrypted.slice(0, 500) : message.decrypted })))
+    );
   },
 
   clearMessages(userId, partnerId) {

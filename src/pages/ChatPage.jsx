@@ -110,6 +110,25 @@ const buildConversationPreview = (messageValue) => {
   return parsed.text || 'Secure channel active';
 };
 
+const buildCallSummary = ({ type, direction, durationSeconds, reason }) => {
+  const label = type === 'video' ? 'Video call' : 'Voice call';
+  if (durationSeconds > 0) {
+    const minutes = Math.floor(durationSeconds / 60);
+    const seconds = durationSeconds % 60;
+    const durationLabel = minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+    return `${label} • ${durationLabel}`;
+  }
+  if (reason === 'missed') return `Missed ${label.toLowerCase()}`;
+  if (reason === 'rejected' || reason === 'busy') return `${label} declined`;
+  if (reason === 'remote-ended') return `${label} ended`;
+  return `${direction === 'incoming' ? 'Incoming' : 'Outgoing'} ${label.toLowerCase()}`;
+};
+
+const needsDecryption = (message) => {
+  if (!message?.payload) return false;
+  return !message.decrypted || message.decrypted === '[Encrypted]' || message.decrypted === '[Decryption Failed]';
+};
+
 const DISAPPEARING_OPTIONS = [
   { key: 'off', label: 'Off' },
   { key: '30s', label: '30 Seconds' },
@@ -185,6 +204,8 @@ const ChatPage = ({ onOpenProfile, onOpenSettings, onOpenSearch, initialChat }) 
   const attachmentInputRef = useRef(null);
   const cameraInputRef = useRef(null);
   const conversationsRef = useRef([]);
+  const historyRequestInFlightRef = useRef(false);
+  const lastHistoryFailureAtRef = useRef(0);
 
   const upsertConversation = useCallback((partnerData) => {
     setConversations(prev => {
@@ -212,10 +233,46 @@ const ChatPage = ({ onOpenProfile, onOpenSettings, onOpenSearch, initialChat }) 
     userStorageService.setMessages(user.id, partnerId, nextMessages);
   }, [user?.id]);
 
+  const appendCallEventToConversation = useCallback((callEntry) => {
+    if (!user?.id || !callEntry?.partnerId) return;
+
+    const createdAt = new Date().toISOString();
+    const callText = buildCallSummary(callEntry);
+    const callMessage = {
+      id: `call_${createdAt}_${callEntry.partnerId}`,
+      from_user_id: user.id,
+      to_user_id: callEntry.partnerId,
+      decrypted: callText,
+      created_at: createdAt,
+      is_outgoing: callEntry.direction === 'outgoing',
+      type: 'call_log',
+      status: 'sent',
+      callMeta: callEntry,
+    };
+
+    const cachedMessages = userStorageService.getMessages(user.id, callEntry.partnerId);
+    const nextMessages = mergeMessages(cachedMessages, [callMessage]);
+    persistMessagesForPartner(callEntry.partnerId, nextMessages);
+
+    if (selectedChatRef.current && getChatUserId(selectedChatRef.current) === callEntry.partnerId) {
+      setMessages(nextMessages);
+    }
+
+    upsertConversation({
+      user_id: callEntry.partnerId,
+      display_name: callEntry.partnerName,
+      avatar: callEntry.partnerAvatar || null,
+      last_message_at: createdAt,
+      last_message_preview: callText,
+      unread_count: 0,
+    });
+  }, [persistMessagesForPartner, upsertConversation, user?.id]);
+
   // WebRTC
   const rtc = useWebRTC({ 
     user, 
     onCallStateChange: undefined,
+    onCallLogged: appendCallEventToConversation,
   });
 
   const scrollToBottom = () => {
@@ -275,15 +332,29 @@ const ChatPage = ({ onOpenProfile, onOpenSettings, onOpenSearch, initialChat }) 
   const loadChatHistory = useCallback(async (chat, { merge = false } = {}) => {
     const chatUserId = getChatUserId(chat);
     if (!chatUserId || !user?.id) return;
+    if (historyRequestInFlightRef.current) return;
+    if (merge && Date.now() - lastHistoryFailureAtRef.current < 10000) return;
 
     // Load from local cache first for instant UI
     if (!merge) {
       const localCached = userStorageService.getMessages(user.id, chatUserId);
       if (localCached.length > 0) {
-        setMessages(localCached);
+        const hydratedCached = privateKey
+          ? await Promise.all(localCached.map(async (message) => {
+              if (!needsDecryption(message)) return message;
+              try {
+                return { ...message, decrypted: await decryptMessage(message.payload, privateKey) };
+              } catch {
+                return message;
+              }
+            }))
+          : localCached;
+        setMessages(hydratedCached);
+        userStorageService.setMessages(user.id, chatUserId, hydratedCached);
       }
     }
 
+    historyRequestInFlightRef.current = true;
     setLoadingHistory(true);
     try {
       const history = await messageService.getHistory(chatUserId);
@@ -301,14 +372,17 @@ const ChatPage = ({ onOpenProfile, onOpenSettings, onOpenSearch, initialChat }) 
       }));
       const orderedHistory = decryptedHistory.reverse();
       setMessages(prev => {
-        const merged = merge ? mergeMessages(prev, orderedHistory) : mergeMessages(userStorageService.getMessages(user.id, chatUserId), orderedHistory);
+        const localBase = merge ? prev : userStorageService.getMessages(user.id, chatUserId);
+        const merged = mergeMessages(localBase, orderedHistory);
         // Persist to local cache
         userStorageService.setMessages(user.id, chatUserId, merged);
         return merged;
       });
     } catch (e) {
+      lastHistoryFailureAtRef.current = Date.now();
       console.error('Failed to load history', e);
     } finally {
+      historyRequestInFlightRef.current = false;
       setLoadingHistory(false);
     }
   }, [privateKey, user?.id]);
@@ -511,7 +585,7 @@ const ChatPage = ({ onOpenProfile, onOpenSettings, onOpenSearch, initialChat }) 
     if (!token) return;
     const interval = setInterval(() => {
       fetchConversations();
-    }, 5000);
+    }, 2500);
     return () => clearInterval(interval);
   }, [fetchConversations, token]);
 
@@ -544,11 +618,12 @@ const ChatPage = ({ onOpenProfile, onOpenSettings, onOpenSearch, initialChat }) 
 
   useEffect(() => {
     if (!selectedChat || !privateKey) return;
+    if (socketService.isConnected()) return;
     const interval = setInterval(() => {
       loadChatHistory(selectedChatRef.current, { merge: true });
-    }, 4000);
+    }, 3500);
     return () => clearInterval(interval);
-  }, [selectedChat, privateKey, loadChatHistory]);
+  }, [selectedChat, privateKey, loadChatHistory, socketStatus]);
 
   // Disappearing messages timer
   useEffect(() => {
@@ -774,11 +849,6 @@ const ChatPage = ({ onOpenProfile, onOpenSettings, onOpenSearch, initialChat }) 
 
       const tempId = `temp_${Date.now()}`;
       optimisticTempId = tempId;
-      const socketSent = socketService.send('message.send', {
-        to: chatUserId,
-        payload: encryptedPayload,
-        tempId,
-      });
 
       const newMessage = {
         id: tempId,
@@ -807,12 +877,7 @@ const ChatPage = ({ onOpenProfile, onOpenSettings, onOpenSearch, initialChat }) 
         online: presenceByUserId[chatUserId]?.online || false,
       });
 
-      if (socketSent) {
-        setTimeout(() => {
-          loadChatHistory(selectedChatRef.current, { merge: true });
-          fetchConversations();
-        }, 150);
-      } else {
+      try {
         const persistedMessage = await messageService.sendMessage(chatUserId, encryptedPayload);
         setMessages(prev => {
           const next = prev.map(message =>
@@ -830,6 +895,20 @@ const ChatPage = ({ onOpenProfile, onOpenSettings, onOpenSearch, initialChat }) 
           return next;
         });
         fetchConversations();
+      } catch (restError) {
+        console.warn('REST send failed, falling back to websocket send', restError);
+        const socketSent = socketService.send('message.send', {
+          to: chatUserId,
+          payload: encryptedPayload,
+          tempId,
+        });
+        if (!socketSent) {
+          throw restError;
+        }
+        setTimeout(() => {
+          loadChatHistory(selectedChatRef.current, { merge: true });
+          fetchConversations();
+        }, 150);
       }
       
     } catch (e) {
